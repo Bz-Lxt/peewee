@@ -245,8 +245,8 @@ class SchemaMigrator(object):
                     field.db_value(default),
                     flat=True)))
 
-    def _alter_table(self, ctx, table):
-        return ctx.literal('ALTER TABLE ').sql(self._table(table))
+    def _alter_table(self, ctx, table, schema=None):
+        return ctx.literal('ALTER TABLE ').sql(self._table(table, schema))
 
     def _alter_column(self, ctx, table, column):
         return (self
@@ -320,14 +320,15 @@ class SchemaMigrator(object):
     @operation
     def add_foreign_key_constraint(self, table, column_name, rel, rel_column,
                                    on_delete=None, on_update=None,
-                                   constraint_name=None, rel_schema=None):
+                                   constraint_name=None, rel_schema=None,
+                                   schema=None):
         constraint = constraint_name or 'fk_%s_%s_refs_%s' % (table,
                                                               column_name,
                                                               rel)
         ctx = (self
                .make_context()
                .literal('ALTER TABLE ')
-               .sql(self._table(table))
+               .sql(self._table(table, schema))
                .literal(' ADD CONSTRAINT ')
                .sql(Entity(_truncate_constraint_name(constraint)))
                .literal(' FOREIGN KEY ')
@@ -386,8 +387,9 @@ class SchemaMigrator(object):
 
         return operations
 
-    def get_foreign_key_constraint(self, table, column_name):
-        for fk in self.database.get_foreign_keys(table, self.schema):
+    def get_foreign_key_constraint(self, table, column_name, schema=None):
+        for fk in self.database.get_foreign_keys(
+                table, schema or self.schema):
             if fk.column == column_name and fk.name:
                 return fk.name
         raise AttributeError(
@@ -416,9 +418,9 @@ class SchemaMigrator(object):
         return ctx
 
     @operation
-    def rename_column(self, table, old_name, new_name):
+    def rename_column(self, table, old_name, new_name, schema=None):
         return (self
-                ._alter_table(self.make_context(), table)
+                ._alter_table(self.make_context(), table, schema)
                 .literal(' RENAME COLUMN ')
                 .sql(Entity(old_name))
                 .literal(' TO ')
@@ -477,10 +479,11 @@ class SchemaMigrator(object):
         return ctx
 
     @operation
-    def rename_table(self, old_name, new_name):
-        # The new name must not be qualified, the table stays in-place.
+    def rename_table(self, old_name, new_name, schema=None):
+        # The new name must not be qualified: the table stays in-place,
+        # in its schema (or database, on MySQL).
         return (self
-                ._alter_table(self.make_context(), old_name)
+                ._alter_table(self.make_context(), old_name, schema)
                 .literal(' RENAME TO ')
                 .sql(Entity(new_name)))
 
@@ -518,7 +521,7 @@ class SchemaMigrator(object):
 
 
 class PostgresqlMigrator(SchemaMigrator):
-    def _primary_key_columns(self, tbl):
+    def _primary_key_columns(self, tbl, schema=None):
         query = """
             SELECT pg_attribute.attname
             FROM pg_index, pg_class, pg_attribute
@@ -530,8 +533,10 @@ class PostgresqlMigrator(SchemaMigrator):
                 indisprimary;
         """
         # regclass parses the identifier, so it is passed quoted.
-        name, _ = self.make_context().sql(self._table(tbl)).query()
-        cursor = self.database.execute_sql(query, (name,))
+        name, _ = self.make_context().sql(
+            self._table(tbl, schema)).query()
+        cursor = self.database.execute_sql(
+            query, (name, schema or self.schema))
         return [row[0] for row in cursor.fetchall()]
 
     @operation
@@ -542,12 +547,12 @@ class PostgresqlMigrator(SchemaMigrator):
                 .sql(Entity(schema_name)))
 
     @operation
-    def rename_table(self, old_name, new_name):
-        pk_names = self._primary_key_columns(old_name)
+    def rename_table(self, old_name, new_name, schema=None):
+        pk_names = self._primary_key_columns(old_name, schema)
         ParentClass = super(PostgresqlMigrator, self)
 
         operations = [
-            ParentClass.rename_table(old_name, new_name)]
+            ParentClass.rename_table(old_name, new_name, schema=schema)]
 
         if len(pk_names) == 1:
             # Check for existence of primary key sequence.
@@ -558,19 +563,21 @@ class PostgresqlMigrator(SchemaMigrator):
                 WHERE LOWER(sequence_name) = LOWER(%s)
                     AND sequence_schema = COALESCE(%s, current_schema())
             """
-            cursor = self.database.execute_sql(query, (seq_name, self.schema))
+            cursor = self.database.execute_sql(
+                query, (seq_name, schema or self.schema))
             if bool(cursor.fetchone()):
                 new_seq_name = '%s_%s_seq' % (new_name, pk_names[0])
                 operations.append(ParentClass.rename_table(
-                    seq_name, new_seq_name))
+                    seq_name, new_seq_name, schema=schema))
 
         return operations
 
     @operation
-    def drop_foreign_key_constraint(self, table, column_name):
-        fk_constraint = self.get_foreign_key_constraint(table, column_name)
+    def drop_foreign_key_constraint(self, table, column_name, schema=None):
+        fk_constraint = self.get_foreign_key_constraint(
+            table, column_name, schema)
         return (self
-                ._alter_table(self.make_context(), table)
+                ._alter_table(self.make_context(), table, schema)
                 .literal(' DROP CONSTRAINT ')
                 .sql(Entity(fk_constraint)))
 
@@ -638,17 +645,20 @@ class MySQLMigrator(SchemaMigrator):
                 .sql(Entity(column)))
 
     @operation
-    def rename_table(self, old_name, new_name):
-        # An unqualified new name moves the table to the current database.
+    def rename_table(self, old_name, new_name, schema=None):
+        # Qualify both sides with the schema (database) so the table is
+        # renamed in place: an unqualified TO name would move it to the
+        # connection's own database.
         return (self
                 .make_context()
                 .literal('RENAME TABLE ')
-                .sql(self._table(old_name))
+                .sql(self._table(old_name, schema))
                 .literal(' TO ')
-                .sql(self._table(new_name)))
+                .sql(self._table(new_name, schema)))
 
-    def _get_column_definition(self, table, column_name):
-        name, _ = self.make_context().sql(self._table(table)).query()
+    def _get_column_definition(self, table, column_name, schema=None):
+        name, _ = self.make_context().sql(
+            self._table(table, schema)).query()
         cursor = self.database.execute_sql('DESCRIBE %s;' % name)
         rows = cursor.fetchall()
         for row in rows:
@@ -658,10 +668,11 @@ class MySQLMigrator(SchemaMigrator):
         return False
 
     @operation
-    def drop_foreign_key_constraint(self, table, column_name):
-        fk_constraint = self.get_foreign_key_constraint(table, column_name)
+    def drop_foreign_key_constraint(self, table, column_name, schema=None):
+        fk_constraint = self.get_foreign_key_constraint(
+            table, column_name, schema)
         return (self
-                ._alter_table(self.make_context(), table)
+                ._alter_table(self.make_context(), table, schema)
                 .literal(' DROP FOREIGN KEY ')
                 .sql(Entity(fk_constraint)))
 
@@ -704,15 +715,16 @@ class MySQLMigrator(SchemaMigrator):
                 .sql(column_def.sql(is_null=True)))
 
     @operation
-    def rename_column(self, table, old_name, new_name):
+    def rename_column(self, table, old_name, new_name, schema=None):
         fk_objects = dict(
             (fk.column, fk)
-            for fk in self.database.get_foreign_keys(table, self.schema))
+            for fk in self.database.get_foreign_keys(
+                    table, schema or self.schema))
         is_foreign_key = old_name in fk_objects
 
-        column = self._get_column_definition(table, old_name)
+        column = self._get_column_definition(table, old_name, schema)
         rename_ctx = (self
-                      ._alter_table(self.make_context(), table)
+                      ._alter_table(self.make_context(), table, schema)
                       .literal(' CHANGE ')
                       .sql(Entity(old_name))
                       .literal(' ')
@@ -720,7 +732,7 @@ class MySQLMigrator(SchemaMigrator):
         if is_foreign_key:
             fk_metadata = fk_objects[old_name]
             return [
-                self.drop_foreign_key_constraint(table, old_name),
+                self.drop_foreign_key_constraint(table, old_name, schema),
                 rename_ctx,
                 self.add_foreign_key_constraint(
                     table,
@@ -728,7 +740,8 @@ class MySQLMigrator(SchemaMigrator):
                     fk_metadata.dest_table,
                     fk_metadata.dest_column,
                     fk_metadata.on_delete,
-                    fk_metadata.on_update),
+                    fk_metadata.on_update,
+                    schema=schema),
             ]
         else:
             return rename_ctx

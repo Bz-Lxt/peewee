@@ -527,11 +527,13 @@ Migration API
       :param str column_name: Name of the column to drop.
       :param bool cascade: Whether the column should be dropped with `CASCADE`.
 
-   .. method:: rename_column(table, old_name, new_name)
+   .. method:: rename_column(table, old_name, new_name, schema=None)
 
       :param str table: Name of the table containing column to rename.
       :param str old_name: Current name of the column.
       :param str new_name: New name for the column.
+      :param str schema: Schema containing the table, overriding the
+          migrator's own schema (PostgreSQL and MySQL only).
 
    .. method:: add_not_null(table, column)
 
@@ -573,10 +575,14 @@ Migration API
       Alter the data-type of a column. This method should be used with care,
       as using incompatible types may not be well-supported by your database.
 
-   .. method:: rename_table(old_name, new_name)
+   .. method:: rename_table(old_name, new_name, schema=None)
 
       :param str old_name: Current name of the table.
       :param str new_name: New name for the table.
+      :param str schema: Schema containing the table, overriding the
+          migrator's own schema (PostgreSQL and MySQL only). The table
+          stays inside that schema -- on MySQL both sides are qualified
+          so it is not moved to the connection's database.
 
    .. method:: drop_table(table, safe=False, cascade=False, schema=None)
 
@@ -824,9 +830,12 @@ common callables ``datetime.datetime.now`` and ``utcnow``,
 as its value. Anything else will be marked with a TODO comment at the top
 of the migration script.
 
-The differ matches columns by name, so a renamed field diffs as an add
-plus a drop. When the data must survive, replace the generated pair with
-a ``rename_column()`` operation.
+The differ matches columns by name, so by default a renamed field diffs
+as an add plus a drop. When the data must survive, pass explicit rename
+mappings to ``diff_models()`` and feed the result to ``template()``; the
+generated migration uses ``rename_table()`` / ``rename_column()``
+instead, carrying data, foreign keys and composite indexes along. See
+:ref:`schema-diff` for details.
 
 Run the migration:
 
@@ -1162,13 +1171,15 @@ The ``playhouse.schema_diff`` module compares model definitions against
 the live database schema and reports basic differences:
 
 * tables to create
+* tables and columns to rename
 * columns added or removed
 * indexes added or removed
 
-Columns are compared by name alone (no types, nullability or constraints), so a
-rename appears as an addition plus a removal. Partial and expression indexes
-are compared by name only. Tables in the database that no model covers are
-ignored. Virtual models (sqlite FTS, etc.) are skipped.
+Columns are compared by name alone (no types, nullability or
+constraints), so without a rename mapping a rename appears as an
+addition plus a removal. Partial and expression indexes are compared by
+name only. Tables in the database that no model covers are ignored.
+Virtual models (sqlite FTS, etc.) are skipped.
 
 .. code-block:: pycon
 
@@ -1182,23 +1193,108 @@ ignored. Virtual models (sqlite FTS, etc.) are skipped.
    drop column user.email
    add index tweet (user_id, flags)
 
-.. function:: diff_models(database, models)
+Renames
+^^^^^^^
+
+A model or field that was renamed can be passed as an explicit mapping
+from the *current* database name to the name the models now declare.
+The rename is then planned as a data-preserving ``RENAME`` instead of a
+drop plus a create; foreign keys and composite indexes follow the
+renamed table or column on every backend, and ``template()`` renders a
+reversible migration (the ``down()`` walk reverses every step).
+
+.. code-block:: python
+
+   from playhouse.migrations import template
+   from playhouse.schema_diff import diff_models
+
+   # The database still holds table "account" with column "email"; the
+   # models now declare Person / table "person" with column "mail".
+   # Column maps are keyed by the current (old) table name.
+   diff = diff_models(
+       db, [Person, Tweet],
+       table_renames={'account': 'person'},
+       column_renames={'account': {'email': 'mail'}})
+   print(template(diff))
+
+Table-rename keys may be ``'schema.table'`` qualified on the backends
+that support schemas (PostgreSQL, MySQL); SQLite has no schema support
+in the migrator and rejects qualified names. When an unqualified table
+name could match tables in several schemas it must be qualified.
+
+Renames pair bijectively. Swapping two names is supported -- map each
+name to the other and the plan parks one of them under a temporary
+name (``__pw_rename_tmp_N``), renames the other into place, then
+restores the parked one:
+
+.. code-block:: python
+
+   diff = diff_models(
+       db, [Person, Widget],
+       table_renames={'person': 'widget', 'widget': 'person'})
+
+A swap between two columns works the same way in ``column_renames``.
+Because both names exist before and after a swap, the swap itself is an
+explicit, data-moving operation rather than something the differ can
+detect as already applied; re-running the differ without the mapping
+shows the schema converged.
+
+Every mapping is validated against the live database and the model
+declarations before the diff is returned: unknown sources or targets,
+duplicate mappings, two names mapped onto one, and a name that is
+occupied without being renamed away all raise ``ValueError``, and the
+validation is strictly read-only -- no migration has run yet when it
+fires.
+
+.. function:: diff_models(database, models, table_renames=None, column_renames=None)
 
    Compare the live schema against the given models. Returns a
    :class:`SchemaDiff` which is falsy when everything matches.
 
+   :param dict table_renames: mapping of the current table names to the
+      model-declared names, e.g. ``{'account': 'person'}``. Keys may be
+      ``'schema.table'`` qualified.
+   :param dict column_renames: mapping keyed by the *current* table name
+      (also schema-qualifiable), of current column names to
+      model-declared names, e.g. ``{'person': {'email': 'mail'}}``.
+   :raises ValueError: an unknown, ambiguous, duplicated or colliding
+      mapping, checked against the database before the diff is produced.
+
 .. class:: SchemaDiff
 
-   A named tuple of five lists, each mapping directly onto a
+   A named tuple of seven lists, each mapping directly onto a
    :class:`~playhouse.migrate.SchemaMigrator` call:
 
    * ``create_tables``: model classes whose tables do not exist, in
      foreign-key dependency order.
+   * ``rename_tables``: :class:`TableRename` entries.
+   * ``rename_columns``: :class:`ColumnRename` entries, addressed by the
+     new (model-declared) table name.
    * ``add_columns``: the model :class:`Field` instances missing from the
      database.
    * ``drop_columns``: ``(table, column_name)`` for database columns no
      model declares.
    * ``add_indexes`` / ``drop_indexes``: :class:`IndexDiff` entries.
+
+.. class:: TableRename
+
+   Named tuple ``(schema, old_name, new_name)``; ``schema`` is ``None``
+   when unqualified. Stringifies as ``rename table s.old to new``.
+
+.. class:: ColumnRename
+
+   Named tuple ``(schema, table, old_name, new_name)``; ``table`` is the
+   new (model-declared) table name, so the rendered
+   ``rename_column()`` follows the table rename in the same migration.
+   Stringifies as ``rename column s.table.old to new``.
+
+.. function:: plan_renames(pairs, occupied)
+
+   Order logical ``(old, new)`` rename pairs into physical rename steps.
+   A free target is taken directly; when every target is occupied (a
+   swap or longer cycle), one source is first parked under a temporary
+   name. Raises ``ValueError`` when a target is occupied by a name that
+   is not itself renamed away, instead of looping forever.
 
 .. class:: IndexDiff
 
@@ -1206,7 +1302,8 @@ ignored. Virtual models (sqlite FTS, etc.) are skipped.
    marks a partial or expression index, detected by name but not
    described. Plain additions carry ``columns``/``unique`` and no name
    (the name is chosen at creation). Removals always carry the name to
-   drop.
+   drop. Index columns follow a column rename, so a composite index over
+   renamed columns pairs instead of being dropped and recreated.
 
 .. _reflection:
 

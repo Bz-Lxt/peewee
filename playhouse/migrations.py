@@ -42,6 +42,7 @@ from peewee import sort_models
 from playhouse.fields import EnumFieldMixin
 from playhouse.migrate import SchemaMigrator
 from playhouse.migrate import make_index_name
+from playhouse.schema_diff import plan_renames
 
 __all__ = ['Migration', 'MigrationError', 'Runner', 'run', 'template']
 
@@ -391,6 +392,24 @@ def _build_add_index(idx):
         idx.columns,
         extra)
 
+def _schema_kwarg(schema):
+    return ', schema=%r' % schema if schema else ''
+
+def _rename_table_call(old_name, new_name, schema):
+    return 'migrator.migrate(migrator.rename_table(%r, %r%s))' % (
+        old_name, new_name, _schema_kwarg(schema))
+
+def _rename_column_call(table, old_name, new_name, schema):
+    return 'migrator.migrate(migrator.rename_column(%r, %r, %r%s))' % (
+        table, old_name, new_name, _schema_kwarg(schema))
+
+def _rename_steps(renames, occupied):
+    # Expand logical renames into physical steps (swaps go through a
+    # temporary name). Each step is its own (up, inverse) pair, so the
+    # plan's reversed walk renders a correct down().
+    pairs = [(r.old_name, r.new_name) for r in renames]
+    return [(old, new) for old, new in plan_renames(pairs, occupied)]
+
 def _block(fn, lines):
     while lines and not lines[-1]:
         lines.pop()
@@ -432,8 +451,27 @@ def template(diff):
             stubs[rel][field.rel_field.name] = field.rel_field
     targets = {model: model.__name__ for model in created | set(stubs)}
 
-    # Build any stub models needed for FKs to resolve properly.
+    # Rename tables first of all: tables created further down, and the
+    # foreign keys they declare, may target the new table names. The
+    # rename carries data, foreign keys and indexes along on every
+    # backend; swaps are expanded through a temporary name.
     plan = []
+    table_groups = {}
+    for rename in diff.rename_tables:
+        table_groups.setdefault(rename.schema, []).append(rename)
+    for schema, renames in table_groups.items():
+        # Occupied names are those currently live: the rename sources.
+        # A target that is also a source (a swap) is what triggers the
+        # temporary-name detour in plan_renames().
+        occupied = {r.old_name for r in renames}
+        occupied.update(m._meta.table_name for m in diff.create_tables
+                        if m._meta.schema == schema)
+        for old_name, new_name in _rename_steps(renames, occupied):
+            plan.append((
+                [_rename_table_call(old_name, new_name, schema)],
+                [_rename_table_call(new_name, old_name, schema)]))
+
+    # Build any stub models needed for FKs to resolve properly.
     for model in sorted(stubs, key=lambda m: m.__name__):
         fields = sorted(stubs[model].values(), key=lambda f: f._sort_key)
         up = _build_stub(model, fields, imports)
@@ -450,6 +488,20 @@ def template(diff):
             meta.table_name,
             ', schema=%r' % meta.schema if meta.schema else '')
         plan.append((up, [down]))
+
+    # Rename columns after their tables. A column swap goes through a
+    # temporary name; composite indexes covering a renamed column follow
+    # it natively, so they pair in the diff instead of being rebuilt.
+    column_groups = {}
+    for rename in diff.rename_columns:
+        column_groups.setdefault(
+            (rename.schema, rename.table), []).append(rename)
+    for (schema, table), renames in column_groups.items():
+        occupied = {r.old_name for r in renames}
+        for old_name, new_name in _rename_steps(renames, occupied):
+            plan.append((
+                [_rename_column_call(table, old_name, new_name, schema)],
+                [_rename_column_call(table, new_name, old_name, schema)]))
 
     # Index drops here to avoid issues dropping indexed columns w/sqlite.
     dropped = set(diff.drop_columns)
@@ -628,7 +680,7 @@ def _resolve_diff(database, spec):
                                  % model.__name__)
             else:
                 accum.append(model)
-        return SchemaDiff(sort_models(accum), [], [], [], [])
+        return SchemaDiff(sort_models(accum), [], [], [], [], [], [])
     try:
         return diff_models(database, models)
     except ValueError as exc:
