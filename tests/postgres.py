@@ -1218,3 +1218,247 @@ class TestJsonColumnTypes(ModelTestCase):
         JBDoc.create(data={'items': [1, 2, 3]})
         self.assertEqual(
             JBDoc.select(JBDoc.data['items'].length()).scalar(), 3)
+
+
+# ===========================================================================
+# Native MERGE ... RETURNING (PostgreSQL 17+)
+# ===========================================================================
+
+def pg17():
+    with db:
+        return db.server_version >= 170000
+
+
+class MergePerson(TestModel):
+    name = CharField()
+    age = IntegerField()
+
+
+class MergePersonCopy(TestModel):
+    name = CharField()
+    age = IntegerField()
+
+
+class MergeUpperCharField(CharField):
+    def db_value(self, value):
+        return value.upper() if value is not None else None
+
+    def python_value(self, value):
+        return value.lower() if value is not None else None
+
+
+class MergeCode(TestModel):
+    code = MergeUpperCharField()
+
+
+class MergeThing(TestModel):
+    label = CharField(column_name='lbl')
+    score = IntegerField(column_name='s')
+
+
+@skip_unless(pg17(), 'requires Postgres 17+ for MERGE ... RETURNING')
+class TestMergeQuery(ModelTestCase):
+    database = db
+    requires = [MergePerson, MergePersonCopy, MergeCode, MergeThing]
+
+    def merge_people(self, rows):
+        fields = [MergePerson.id, MergePerson.name, MergePerson.age]
+        source = Merge.values(rows, fields)
+        return (MergePerson
+                .merge(source, on=(MergePerson.id == source.c.id))
+                .when_matched(delete=True,
+                              condition=(source.c.age < 1))
+                .when_matched(update={
+                    MergePerson.name: source.c.name,
+                    MergePerson.age: source.c.age})
+                .when_not_matched())
+
+    def test_merge_update_delete_insert(self):
+        MergePerson.create(id=1, name='huey', age=3)
+        MergePerson.create(id=2, name='mickey', age=8)
+        MergePerson.create(id=3, name='zaizee', age=1)
+
+        cursor = self.merge_people([
+            (1, 'huey-two', 4),    # Matched -> updated.
+            (2, 'mickey', 0),      # Matched, age < 1 -> deleted.
+            (4, 'beanie', 2),      # Not matched -> inserted.
+        ]).execute()
+        results = dict((person.id, person) for person in cursor)
+        self.assertEqual(set(results), {1, 2, 4})
+        for person in results.values():
+            self.assertTrue(isinstance(person, MergePerson))
+            # Rows returned by RETURNING are clean model instances.
+            self.assertFalse(person.is_dirty())
+
+        # The updated row carries the new values.
+        self.assertEqual(results[1].name, 'huey-two')
+        self.assertEqual(results[1].age, 4)
+
+        # A deleted row is returned with its pre-delete values.
+        self.assertEqual(results[2].name, 'mickey')
+        self.assertEqual(results[2].age, 8)
+
+        self.assertEqual(results[4].name, 'beanie')
+        self.assertEqual(results[4].age, 2)
+
+        stored = dict((p.id, (p.name, p.age))
+                      for p in MergePerson.select())
+        self.assertEqual(stored, {
+            1: ('huey-two', 4),
+            3: ('zaizee', 1),
+            4: ('beanie', 2)})
+
+    def test_merge_do_nothing(self):
+        MergePerson.create(id=1, name='huey', age=3)
+
+        source = Merge.values(
+            [(1, 'updated', 9), (2, 'new', 5)],
+            [MergePerson.id, MergePerson.name, MergePerson.age])
+        cursor = (MergePerson
+                  .merge(source, on=(MergePerson.id == source.c.id))
+                  .when_matched(do_nothing=True)
+                  .when_not_matched()
+                  .execute())
+        inserted = list(cursor)
+        self.assertEqual(len(inserted), 1)
+        self.assertEqual(inserted[0].id, 2)
+        self.assertEqual(inserted[0].name, 'new')
+
+        # The matched row was left untouched.
+        huey = MergePerson[1]
+        self.assertEqual((huey.name, huey.age), ('huey', 3))
+
+    def test_merge_select_source(self):
+        MergePerson.create(id=1, name='huey', age=3)
+        MergePerson.create(id=2, name='mickey', age=8)
+
+        def build():
+            source = MergePerson.select(MergePerson.id, MergePerson.name,
+                                        MergePerson.age)
+            return (MergePersonCopy
+                    .merge(source, on=(MergePersonCopy.id == source.c.id))
+                    .when_matched(update={
+                        MergePersonCopy.name: source.c.name,
+                        MergePersonCopy.age: source.c.age})
+                    .when_not_matched())
+
+        # First run: nothing matches, both rows are inserted.
+        results = list(build().execute())
+        self.assertEqual(sorted(p.id for p in results), [1, 2])
+        self.assertTrue(all(isinstance(p, MergePersonCopy) for p in results))
+        self.assertEqual(MergePersonCopy.select().count(), 2)
+
+        # Second run: everything matches and is updated.
+        MergePerson.update(age=MergePerson.age + 10).execute()
+        results = list(build().execute())
+        self.assertEqual(sorted((p.id, p.age) for p in results),
+                         [(1, 13), (2, 18)])
+        self.assertEqual(MergePersonCopy.select().count(), 2)
+
+        # A newly-appearing source row is inserted.
+        MergePerson.create(id=3, name='beanie', age=2)
+        results = list(build().execute())
+        self.assertEqual(sorted(p.id for p in results), [1, 2, 3])
+        self.assertEqual(MergePersonCopy.select().count(), 3)
+
+    def test_merge_field_conversion(self):
+        MergeCode.create(id=1, code='old')
+
+        source = Merge.values(
+            [{'id': 1, 'code': 'xyz'}, {'id': 2, 'code': 'abc'}],
+            [MergeCode.id, MergeCode.code])
+        results = dict((obj.id, obj) for obj in
+                       (MergeCode
+                        .merge(source, on=(MergeCode.id == source.c.id))
+                        .when_matched(update={MergeCode.code: source.c.code})
+                        .when_not_matched()
+                        .execute()))
+
+        # python_value() is applied to the RETURNING output.
+        self.assertEqual(results[1].code, 'xyz')
+        self.assertEqual(results[2].code, 'abc')
+
+        # db_value() was applied when writing (stored upper-cased).
+        curs = self.database.execute_sql(
+            'SELECT code FROM %s ORDER BY id' % MergeCode._meta.table_name)
+        self.assertEqual([row[0] for row in curs.fetchall()],
+                         ['XYZ', 'ABC'])
+
+        # Rows read back through the ORM are converted once again.
+        self.assertEqual(MergeCode[1].code, 'xyz')
+        self.assertEqual(MergeCode[2].code, 'abc')
+
+    def test_merge_column_name_alias(self):
+        source = Merge.values(
+            [{'id': 1, 'label': 'one', 'score': 10}],
+            [MergeThing.id, MergeThing.label, MergeThing.score])
+        results = list(MergeThing
+                       .merge(source, on=(MergeThing.id == source.c.id))
+                       .when_matched(update={
+                           MergeThing.label: source.c.lbl,
+                           MergeThing.score: source.c.s})
+                       .when_not_matched()
+                       .execute())
+        self.assertEqual(len(results), 1)
+        thing = results[0]
+        self.assertTrue(isinstance(thing, MergeThing))
+        self.assertEqual(thing.label, 'one')
+        self.assertEqual(thing.score, 10)
+
+        curs = self.database.execute_sql(
+            'SELECT lbl, s FROM %s' % MergeThing._meta.table_name)
+        self.assertEqual(curs.fetchall(), [('one', 10)])
+
+    def test_merge_custom_returning(self):
+        source = Merge.values([(1, 'huey', 3)],
+                              [MergePerson.id, MergePerson.name,
+                               MergePerson.age])
+        cursor = (MergePerson
+                  .merge(source, on=(MergePerson.id == source.c.id))
+                  .when_not_matched()
+                  .returning(MergePerson.id)
+                  .execute())
+        person, = list(cursor)
+        self.assertTrue(isinstance(person, MergePerson))
+        self.assertEqual(person.id, 1)
+
+    def test_merge_is_atomic_on_failure(self):
+        MergePerson.create(id=1, name='huey', age=3)
+        before = list(MergePerson.select().order_by(MergePerson.id).tuples())
+
+        # The second new row violates the NOT NULL constraint, which aborts
+        # the whole MERGE statement -- the matched update and the valid
+        # insert must not be persisted.
+        source = Merge.values([
+            (1, 'updated', 9),
+            (10, 'ok', 1),
+            (11, None, 5),
+        ], [MergePerson.id, MergePerson.name, MergePerson.age])
+        query = (MergePerson
+                 .merge(source, on=(MergePerson.id == source.c.id))
+                 .when_matched(update={
+                     MergePerson.name: source.c.name,
+                     MergePerson.age: source.c.age})
+                 .when_not_matched())
+        with self.assertRaises(IntegrityError):
+            query.execute()
+
+        after = list(MergePerson.select().order_by(MergePerson.id).tuples())
+        self.assertEqual(before, after)
+        self.assertFalse(MergePerson.select()
+                         .where(MergePerson.id == 10).exists())
+
+    def test_merge_unsupported_old_version(self):
+        source = Merge.values([(1, 'huey', 3)],
+                              [MergePerson.id, MergePerson.name,
+                               MergePerson.age])
+        query = (MergePerson
+                 .merge(source, on=(MergePerson.id == source.c.id))
+                 .when_not_matched())
+        original = self.database.server_version
+        self.database.server_version = 160004
+        try:
+            with self.assertRaises(NotSupportedError):
+                query.execute()
+        finally:
+            self.database.server_version = original

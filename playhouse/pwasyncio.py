@@ -1259,6 +1259,14 @@ class AsyncPostgresqlDatabase(AsyncDatabaseMixin, PostgresqlDatabase):
         conn = await asyncio.wait_for(
             pool.acquire(),
             timeout=self._acquire_timeout)
+        if self.server_version is None:
+            # asyncpg exposes a ServerVersion named-tuple. Encode it the way
+            # libpq reports server_version_num so version gates (e.g.
+            # MERGE ... RETURNING on PostgreSQL 17+) behave like the sync
+            # drivers.
+            info = conn.get_server_version()
+            self.server_version = (info.major * 10000 + info.minor * 100 +
+                                   info.micro)
         return AsyncPostgresqlConnection(conn)
 
     async def _pool_release(self, conn):

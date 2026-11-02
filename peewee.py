@@ -123,6 +123,7 @@ __all__ = [
     'JSONField',
     'Load',
     'ManyToManyField',
+    'Merge',
     'Model',
     'ModelIndex',
     'MySQLDatabase',
@@ -1095,6 +1096,10 @@ class Table(_HashableSource, BaseTable):
     def delete(self):
         return Delete(self)
 
+    @__bind_database__
+    def merge(self, source, on=None):
+        return Merge(self, source, on)
+
     def __sql__(self, ctx):
         if ctx.scope == SCOPE_VALUES:
             # Return the quoted table name.
@@ -1134,9 +1139,15 @@ class Join(BaseTable):
 
 
 class ValuesList(_HashableSource, BaseTable):
-    def __init__(self, values, columns=None, alias=None):
+    def __init__(self, values, columns=None, alias=None, column_types=None):
         self._values = values
         self._columns = columns
+        # Optional per-column SQL type names. When present, the parameters
+        # in the first VALUES row are wrapped in a CAST(), which lets the
+        # server infer parameter types for the whole VALUES relation. This
+        # is required when a MERGE uses the list as its source over
+        # strictly-typed protocols (e.g. asyncpg's extended protocol).
+        self._column_types = column_types
         super(ValuesList, self).__init__(alias=alias)
 
     def _get_hash(self):
@@ -1151,11 +1162,27 @@ class ValuesList(_HashableSource, BaseTable):
             ctx.alias_manager[self] = self._alias
 
         if ctx.scope == SCOPE_SOURCE or ctx.scope == SCOPE_NORMAL:
+            rows = self._values
+            if self._column_types and rows:
+                # Casting the first row is sufficient: the server derives
+                # the relation's column types from it and coerces the
+                # remaining rows (and their parameters) accordingly.
+                field_types = ctx.state.field_types or {}
+                first_row = []
+                for node, column_type in zip(rows[0],
+                                             self._column_types):
+                    if column_type:
+                        type_name = field_types.get(column_type,
+                                                    column_type)
+                        node = Cast(node, type_name)
+                    first_row.append(node)
+                rows = [first_row] + list(rows[1:])
+
             with ctx(parentheses=(not ctx.parentheses) or ctx.state.in_expr):
                 ctx = (ctx
                        .literal('VALUES ')
                        .sql(CommaNodeList([
-                           EnclosedNodeList(row) for row in self._values])))
+                           EnclosedNodeList(row) for row in rows])))
 
             # The SELECT list and ON clauses are SCOPE_SOURCE too.
             is_operand = ctx.state.in_expr or ctx.state.in_projection
@@ -3113,6 +3140,258 @@ class Delete(_WriteQuery):
             return self.apply_returning(ctx)
 
 
+def _merge_field_column_type(field):
+    # Resolve a field to the SQL type name used to CAST the first-row
+    # parameters of a MERGE's VALUES source. Auto-incrementing primary keys
+    # map to their underlying integer type (SERIAL/BIGSERIAL are pseudo-types
+    # used by DDL and are not valid cast targets).
+    if not isinstance(field, Field):
+        return None
+    field_type = field.field_type
+    if field_type == 'AUTO':
+        return 'INT'
+    elif field_type == 'BIGAUTO':
+        return 'BIGINT'
+    elif field_type.startswith('INT GENERATED'):
+        return 'INT'
+    return field_type
+
+
+class Merge(_WriteQuery):
+    # Native SQL-standard MERGE statement. The dialect-level support is
+    # advertised via the database's "merge_support" flag, while support for
+    # the RETURNING clause (used to return model instances) is checked at
+    # execution-time via Database.supports_merge().
+    MATCHED = 'MATCHED'
+    NOT_MATCHED = 'NOT MATCHED'
+    UPDATE = 'UPDATE'
+    DELETE = 'DELETE'
+    INSERT = 'INSERT'
+    NOTHING = 'NOTHING'
+
+    def __init__(self, table, source, on=None, actions=(), **kwargs):
+        super(Merge, self).__init__(table, **kwargs)
+        self._source = source
+        self._on = on
+        self._actions = tuple(actions)
+
+    @staticmethod
+    def values(rows, fields, alias='src'):
+        # Build a ValuesList suitable for use as a MERGE source, binding each
+        # value through the corresponding field's db_value() converter, so
+        # that the merge applies the same data-adaptation as an INSERT.
+        rows = list(rows)
+        if not rows:
+            raise ValueError('No rows to merge.')
+
+        fields = list(ensure_tuple(fields))
+        lookups = {}
+        for field in fields:
+            keys = [field]
+            if isinstance(field, Field):
+                keys.extend((field.name, field.column_name))
+            lookups[field] = keys
+
+        all_rows = []
+        for row in rows:
+            is_dict = isinstance(row, Mapping)
+            values = []
+            for field in fields:
+                if is_dict:
+                    for key in lookups[field]:
+                        try:
+                            value = row[key]
+                        except KeyError:
+                            pass
+                        else:
+                            break
+                    else:
+                        raise KeyError(field)
+                else:
+                    value = row[len(values)]
+
+                converter = field.db_value if isinstance(field, Field) else None
+                if (not isinstance(value, Node) or
+                        (isinstance(value, Model) and
+                         isinstance(field, ForeignKeyField))):
+                    # Wrap Model values explicitly so a ForeignKeyField is
+                    # able to adapt them to the related primary-key value.
+                    value = Value(value, converter=converter, unpack=False)
+                values.append(value)
+            all_rows.append(values)
+
+        columns = tuple(field.column_name if isinstance(field, Field)
+                        else field.name for field in fields)
+        column_types = tuple(_merge_field_column_type(field)
+                             for field in fields)
+        return ValuesList(all_rows, columns=columns, alias=alias,
+                          column_types=column_types)
+
+    @Node.copy
+    def on(self, condition):
+        self._on = condition
+
+    @Node.copy
+    def when_matched(self, update=None, condition=None, delete=False,
+                     do_nothing=False):
+        flags = (bool(update), bool(delete), bool(do_nothing))
+        if sum(flags) != 1:
+            raise ValueError('Specify exactly one action for WHEN MATCHED: '
+                             'update, delete or do_nothing.')
+        if update:
+            action, data = self.UPDATE, self._normalize_data(update)
+        elif delete:
+            action, data = self.DELETE, None
+        else:
+            action, data = self.NOTHING, None
+        self._actions = self._actions + (
+            (self.MATCHED, action, data, condition),)
+
+    @Node.copy
+    def when_not_matched(self, insert=None, condition=None, do_nothing=False):
+        if do_nothing:
+            if insert:
+                raise ValueError('Cannot provide insert data when '
+                                 'do_nothing=True.')
+            action, data = self.NOTHING, None
+        else:
+            action, data = self.INSERT, self._normalize_data(insert)
+        self._actions = self._actions + (
+            (self.NOT_MATCHED, action, data, condition),)
+
+    def _resolve_key(self, key):
+        if isinstance(key, str):
+            return self.table.c[key]
+        return key
+
+    def _normalize_data(self, data):
+        if not data:
+            return data
+        return dict((self._resolve_key(key), value)
+                    for key, value in data.items())
+
+    def _source_columns(self):
+        # Return the output column names exposed by the merge source.
+        source = self._source
+        columns = getattr(source, '_columns', None)
+        if columns:
+            return list(columns)
+
+        # A Select source exposes the columns in its projection.
+        selected = getattr(source, 'selected_columns', None)
+        if selected:
+            names = []
+            for node in selected:
+                if isinstance(node, Alias):
+                    names.append(node._alias)
+                    continue
+                node = node.unwrap() if hasattr(node, 'unwrap') else node
+                if isinstance(node, Field):
+                    names.append(node.column_name)
+                elif isinstance(node, Column):
+                    names.append(node.name)
+                else:
+                    return
+            return names
+
+    def _default_insert_data(self):
+        # Map each source column onto the same-named target column.
+        columns = self._source_columns()
+        if not columns:
+            raise ValueError('An explicit insert mapping is required when '
+                             'the merge source does not declare columns.')
+        return dict((self._resolve_key(name), self._source.c[name])
+                    for name in columns)
+
+    def _build_update(self, data, ctx):
+        expressions = []
+        for key, value in sorted(data.items(), key=ctx.column_sort_key):
+            if not isinstance(value, Node):
+                if isinstance(key, Field):
+                    value = key.to_value(value)
+                else:
+                    value = Value(value, unpack=False)
+            elif isinstance(value, Model) and isinstance(key, ForeignKeyField):
+                value = key.to_value(value)
+
+            if not isinstance(value, Value):
+                value = qualify_names(value)
+            expressions.append(NodeList((key, SQL('='), value)))
+
+        ctx.literal('UPDATE SET ').sql(CommaNodeList(expressions))
+
+    def _build_insert(self, data, ctx):
+        keys = sorted(data, key=lambda key: key.get_sort_key(ctx))
+        values = []
+        for key in keys:
+            value = data[key]
+            if (not isinstance(value, Node) or
+                    (isinstance(value, Model) and
+                     isinstance(key, ForeignKeyField))):
+                converter = key.db_value if isinstance(key, Field) else None
+                value = Value(value, converter=converter, unpack=False)
+            else:
+                value = qualify_names(value)
+            values.append(value)
+
+        ctx.literal('INSERT ').sql(EnclosedNodeList(keys))
+        ctx.literal(' VALUES ').sql(EnclosedNodeList(values))
+
+    def _apply_action(self, action, ctx):
+        when, kind, data, condition = action
+        ctx.literal(' WHEN ').literal(when)
+        if condition is not None:
+            with ctx.scope_normal():
+                ctx.literal(' AND ').sql(condition)
+        ctx.literal(' THEN ')
+        if kind == self.UPDATE:
+            self._build_update(data, ctx)
+        elif kind == self.DELETE:
+            ctx.literal('DELETE')
+        elif kind == self.INSERT:
+            if data is None:
+                data = self._default_insert_data()
+            self._build_insert(data, ctx)
+        else:
+            ctx.literal('DO NOTHING')
+
+    def _execute(self, database):
+        if not database.supports_merge():
+            raise NotSupportedError(
+                'MERGE with RETURNING is only supported by PostgreSQL 17 or '
+                'newer.')
+        return super(Merge, self)._execute(database)
+
+    def __sql__(self, ctx):
+        super(Merge, self).__sql__(ctx)
+        merge_supported = ctx.state.merge_support
+        if merge_supported is None and self._database is not None:
+            # Fall back to the bound database's advertised support when the
+            # context was not built by a database (e.g. query.sql() or the
+            # test-harness rendering with a bare Context).
+            merge_supported = self._database.merge_support
+        if not merge_supported:
+            raise NotSupportedError(
+                'MERGE statements are not supported by this database. '
+                'Native MERGE with RETURNING requires PostgreSQL 17 or '
+                'newer.')
+        if self._on is None:
+            raise ValueError('A MERGE query requires an ON condition.')
+        if not self._actions:
+            raise ValueError('A MERGE query requires at least one WHEN '
+                             'clause.')
+
+        with ctx.scope_values(subquery=True):
+            ctx.literal('MERGE INTO ').sql(self.table)
+            with ctx.scope_source():
+                ctx.literal(' USING ').sql(self._source)
+            with ctx.scope_normal():
+                ctx.literal(' ON ').sql(self._on)
+            for action in self._actions:
+                self._apply_action(action, ctx)
+            return self.apply_returning(ctx)
+
+
 class Index(Node):
     def __init__(self, name, table, expressions, unique=False, safe=False,
                  where=None, using=None, nulls_distinct=None):
@@ -3755,6 +4034,7 @@ class Database(_callable_context_manager):
     index_using_precedes_table = False
     index_value_literals = False
     limit_max = None
+    merge_support = False
     nulls_ordering = False
     returning_clause = False
     safe_create_index = True
@@ -3947,6 +4227,7 @@ class Database(_callable_context_manager):
             'index_schema_prefix': self.index_schema_prefix,
             'index_using_precedes_table': self.index_using_precedes_table,
             'limit_max': self.limit_max,
+            'merge_support': self.merge_support,
             'nulls_ordering': self.nulls_ordering,
             'use_concat_function': self.use_concat_function,
         }
@@ -3962,6 +4243,12 @@ class Database(_callable_context_manager):
 
     def conflict_update(self, on_conflict, query):
         raise NotImplementedError
+
+    def supports_merge(self):
+        # Returns True if the database can execute native MERGE queries that
+        # use a RETURNING clause (checked at execution-time, when the server
+        # version is known).
+        return self.merge_support
 
     def _conflict_update_items(self, on_conflict, query, qualify):
         items = []
@@ -4780,6 +5067,11 @@ class PostgresqlDatabase(Database):
     returning_clause = True
     sequences = True
 
+    # PostgreSQL supports the MERGE statement, but the RETURNING clause for
+    # MERGE (which we use to return model instances) was only added in 17.
+    merge_support = True
+    merge_returning_version = 170000
+
     psycopg2_adapter = Psycopg2Adapter
     psycopg3_adapter = Psycopg3Adapter
 
@@ -4821,6 +5113,15 @@ class PostgresqlDatabase(Database):
 
     def _set_server_version(self, conn):
         self.server_version = self._adapter.get_server_version(conn)
+
+    def supports_merge(self):
+        # The server version is only populated after connecting. Connecting
+        # here is harmless when the query is about to be executed, since a
+        # connection would be opened regardless.
+        if self.server_version is None:
+            self.connect()
+        return bool(self.server_version) and (
+            self.server_version >= self.merge_returning_version)
 
     def is_connection_usable(self):
         if self._state.closed:
@@ -7878,6 +8179,25 @@ class Model(Node, metaclass=ModelBase):
                 .on_conflict('REPLACE'))
 
     @classmethod
+    def merge(cls, source, on=None, fields=None, alias='src'):
+        # The merge source is a Select query or a ValuesList. For convenience
+        # an iterable of rows (tuples or dicts) is converted into a
+        # ValuesList, applying each field's db_value() converter.
+        if not isinstance(source, (ValuesList, SelectQuery)):
+            rows = list(source)
+            if fields is None:
+                if rows and isinstance(rows[0], Mapping):
+                    fields = [cls._meta.combined[key] if isinstance(key, str)
+                              else key for key in rows[0]]
+                else:
+                    fields = list(cls._meta.sorted_fields)
+            else:
+                fields = [cls._meta.combined[key] if isinstance(key, str)
+                          else key for key in ensure_tuple(fields)]
+            source = Merge.values(rows, fields, alias)
+        return ModelMerge(cls, source, on)
+
+    @classmethod
     def raw(cls, sql, *params):
         return ModelRaw(cls, sql, params)
 
@@ -8922,6 +9242,33 @@ class ModelInsert(_ModelWriteQueryHelper, Insert):
 
 class ModelDelete(_ModelWriteQueryHelper, Delete):
     pass
+
+
+class ModelMerge(_ModelWriteQueryHelper, Merge):
+    # A merge returns the affected rows as model instances by default.
+    default_row_type = ROW.MODEL
+
+    def __init__(self, *args, **kwargs):
+        super(ModelMerge, self).__init__(*args, **kwargs)
+        if self._returning is None:
+            self._returning = tuple(self.model._meta.sorted_fields)
+            self._return_cursor = True
+
+    def returning(self, *returning):
+        # Explicitly specifying a returning clause defaults to yielding model
+        # instances (mirrors the behavior of ModelInsert).
+        if returning and self._row_type is None:
+            self._row_type = ROW.MODEL
+        return super(ModelMerge, self).returning(*returning)
+
+    def _resolve_key(self, key):
+        if isinstance(key, str):
+            return self.model._meta.combined[key]
+        return key
+
+    def _get_model_cursor_wrapper(self, cursor):
+        return ModelObjectCursorWrapper(cursor, self.model,
+                                        self._returning, self.model)
 
 
 class ManyToManyQuery(ModelSelect):

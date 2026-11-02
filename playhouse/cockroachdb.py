@@ -55,6 +55,13 @@ class CockroachDatabase(PostgresqlDatabase):
         'BLOB': 'BYTES',
     })
 
+    # CockroachDB's MERGE is not PostgreSQL's SQL-standard MERGE and does not
+    # provide the same RETURNING semantics, so it is not advertised.
+    merge_support = False
+
+    def supports_merge(self):
+        return False
+
     def __init__(self, database, *args, **kwargs):
         # Unless a DSN or database connection-url were specified, provide
         # convenient defaults for the user and port.

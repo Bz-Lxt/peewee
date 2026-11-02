@@ -2336,3 +2336,329 @@ class TestQuerySqlMethod(ModelDatabaseTestCase):
         query = User.delete().where(User.id == 1)
         self.assertSQL(query, (
             'DELETE FROM "users" WHERE ("users"."id" = ?)'), [1])
+
+
+# ===========================================================================
+# Native MERGE statement (PostgreSQL 17+)
+# ===========================================================================
+#
+# These models are bound to a disconnected PostgresqlDatabase, so the
+# rendered SQL uses the postgres dialect ("%s" params) without requiring a
+# server or a postgres driver.
+
+_merge_pg_db = PostgresqlDatabase(None)
+
+
+class _MergePGModel(Model):
+    class Meta:
+        database = _merge_pg_db
+
+
+class MergeUser(_MergePGModel):
+    username = CharField()
+    age = IntegerField()
+    class Meta:
+        table_name = 'merge_user'
+
+
+class MergeTweet(_MergePGModel):
+    user = ForeignKeyField(MergeUser)
+    content = TextField()
+    class Meta:
+        table_name = 'merge_tweet'
+
+
+class MergeWeird(_MergePGModel):
+    named = CharField(column_name='renamed_col')
+    score = IntegerField(column_name='s')
+    class Meta:
+        table_name = 'merge_weird'
+
+
+class TestMergeSQL(BaseTestCase):
+    database = _merge_pg_db
+
+    def render(self, query):
+        return _merge_pg_db.get_sql_context().sql(query).query()
+
+    def test_merge_values_source(self):
+        source = Merge.values([
+            {'id': 1, 'username': 'huey', 'age': 5},
+            {'id': 2, 'username': 'mickey', 'age': 3},
+        ], [MergeUser.id, MergeUser.username, MergeUser.age])
+        query = (MergeUser
+                 .merge(source, on=(MergeUser.id == source.c.id))
+                 .when_matched(update={
+                     MergeUser.username: source.c.username,
+                     MergeUser.age: source.c.age})
+                 .when_not_matched())
+        sql, params = self.render(query)
+        self.assertEqual(sql, (
+            'MERGE INTO "merge_user" '
+            'USING (VALUES '
+            '(CAST(%s AS INTEGER), CAST(%s AS VARCHAR), CAST(%s AS INTEGER)'
+            '), (%s, %s, %s)) '
+            'AS "src"("id", "username", "age") '
+            'ON ("merge_user"."id" = "src"."id") '
+            'WHEN MATCHED THEN UPDATE SET '
+            '"username" = "src"."username", "age" = "src"."age" '
+            'WHEN NOT MATCHED THEN INSERT ("id", "username", "age") '
+            'VALUES ("src"."id", "src"."username", "src"."age") '
+            'RETURNING "merge_user"."id", "merge_user"."username", '
+            '"merge_user"."age"'))
+        self.assertEqual(params, [1, 'huey', 5, 2, 'mickey', 3])
+
+    def test_merge_tuple_rows_default_fields(self):
+        # Iterable of tuples is wrapped in a ValuesList using all the
+        # model's sorted fields by default.
+        query = (MergeUser
+                 .merge([(1, 'huey', 5)],
+                        on=(MergeUser.id == SQL('src.id')))
+                 .when_matched(update={MergeUser.age: SQL('src.age')})
+                 .when_not_matched())
+        sql, params = self.render(query)
+        self.assertEqual(sql, (
+            'MERGE INTO "merge_user" USING (VALUES '
+            '(CAST(%s AS INTEGER), CAST(%s AS VARCHAR), CAST(%s AS INTEGER))'
+            ') AS "src"("id", "username", "age") '
+            'ON ("merge_user"."id" = src.id) '
+            'WHEN MATCHED THEN UPDATE SET "age" = src.age '
+            'WHEN NOT MATCHED THEN INSERT ("id", "username", "age") '
+            'VALUES ("src"."id", "src"."username", "src"."age") '
+            'RETURNING "merge_user"."id", "merge_user"."username", '
+            '"merge_user"."age"'))
+        self.assertEqual(params, [1, 'huey', 5])
+
+    def test_merge_conditional_actions_and_returning(self):
+        source = Merge.values([
+            (1, 'huey', 3),
+            (2, 'mickey', 7),
+        ], [MergeUser.id, MergeUser.username, MergeUser.age])
+        query = (MergeUser
+                 .merge(source, on=(MergeUser.id == source.c.id))
+                 .when_matched(delete=True, condition=(source.c.age < 4))
+                 .when_matched(update={MergeUser.age: source.c.age})
+                 .when_not_matched(
+                     insert={MergeUser.username: source.c.username,
+                             MergeUser.age: source.c.age},
+                     condition=(source.c.age > 0))
+                 .returning(MergeUser.id, MergeUser.username))
+        sql, params = self.render(query)
+        self.assertEqual(sql, (
+            'MERGE INTO "merge_user" '
+            'USING (VALUES '
+            '(CAST(%s AS INTEGER), CAST(%s AS VARCHAR), CAST(%s AS INTEGER)'
+            '), (%s, %s, %s)) '
+            'AS "src"("id", "username", "age") '
+            'ON ("merge_user"."id" = "src"."id") '
+            'WHEN MATCHED AND ("src"."age" < %s) THEN DELETE '
+            'WHEN MATCHED THEN UPDATE SET "age" = "src"."age" '
+            'WHEN NOT MATCHED AND ("src"."age" > %s) '
+            'THEN INSERT ("username", "age") '
+            'VALUES ("src"."username", "src"."age") '
+            'RETURNING "merge_user"."id", "merge_user"."username"'))
+        self.assertEqual(params, [1, 'huey', 3, 2, 'mickey', 7, 4, 0])
+
+    def test_merge_do_nothing(self):
+        source = Merge.values([(10, 'zaizee', 9)],
+                              [MergeUser.id, MergeUser.username,
+                               MergeUser.age])
+        query = (MergeUser
+                 .merge(source, on=(MergeUser.id == source.c.id))
+                 .when_matched(do_nothing=True)
+                 .when_not_matched())
+        sql, params = self.render(query)
+        self.assertEqual(sql, (
+            'MERGE INTO "merge_user" USING (VALUES '
+            '(CAST(%s AS INTEGER), CAST(%s AS VARCHAR), CAST(%s AS INTEGER))'
+            ') AS "src"("id", "username", "age") '
+            'ON ("merge_user"."id" = "src"."id") '
+            'WHEN MATCHED THEN DO NOTHING '
+            'WHEN NOT MATCHED THEN INSERT ("id", "username", "age") '
+            'VALUES ("src"."id", "src"."username", "src"."age") '
+            'RETURNING "merge_user"."id", "merge_user"."username", '
+            '"merge_user"."age"'))
+        self.assertEqual(params, [10, 'zaizee', 9])
+
+    def test_merge_select_source(self):
+        source = (MergeUser
+                  .select(MergeUser.id, MergeUser.username, MergeUser.age)
+                  .where(MergeUser.age > 1))
+        query = (MergeUser
+                 .merge(source, on=(MergeUser.id == source.c.id))
+                 .when_matched(update={
+                     MergeUser.username: source.c.username})
+                 .when_not_matched())
+        sql, params = self.render(query)
+        self.assertEqual(sql, (
+            'MERGE INTO "merge_user" '
+            'USING (SELECT "merge_user"."id", "merge_user"."username", '
+            '"merge_user"."age" FROM "merge_user" AS "merge_user" '
+            'WHERE ("merge_user"."age" > %s)) AS "t1" '
+            'ON ("merge_user"."id" = "t1"."id") '
+            'WHEN MATCHED THEN UPDATE SET "username" = "t1"."username" '
+            'WHEN NOT MATCHED THEN INSERT ("id", "username", "age") '
+            'VALUES ("t1"."id", "t1"."username", "t1"."age") '
+            'RETURNING "merge_user"."id", "merge_user"."username", '
+            '"merge_user"."age"'))
+        self.assertEqual(params, [1])
+
+    def test_merge_select_source_explicit_insert_required(self):
+        # A projection without declared output columns (e.g. an unaliased
+        # function call) cannot be mapped automatically, so an explicit
+        # insert mapping is required.
+        source = MergeUser.select(fn.MAX(MergeUser.age))
+        query = (MergeUser
+                 .merge(source, on=(MergeUser.id == MergeUser.id))
+                 .when_matched(update={MergeUser.age: MergeUser.age})
+                 .when_not_matched())
+        with self.assertRaisesCtx(ValueError):
+            self.render(query)
+
+    def test_merge_raw_table(self):
+        table = Table('merge_user')
+        source = ValuesList([(1, 'huey')], columns=('id', 'username'),
+                            alias='s')
+        query = (table
+                 .merge(source, on=(table.c.id == source.c.id))
+                 .when_not_matched(insert={
+                     'id': source.c.id,
+                     'username': source.c.username}))
+        sql, params = self.render(query)
+        self.assertEqual(sql, (
+            'MERGE INTO "merge_user" '
+            'USING (VALUES (%s, %s)) AS "s"("id", "username") '
+            'ON ("merge_user"."id" = "s"."id") '
+            'WHEN NOT MATCHED THEN INSERT ("id", "username") '
+            'VALUES ("s"."id", "s"."username")'))
+        self.assertEqual(params, [1, 'huey'])
+
+    def test_merge_column_name_aliases(self):
+        source = Merge.values(
+            [{'id': 1, 'named': 'a', 'score': 2}],
+            [MergeWeird.id, MergeWeird.named, MergeWeird.score])
+        query = (MergeWeird
+                 .merge(source, on=(MergeWeird.id == source.c.id))
+                 .when_matched(update={
+                     MergeWeird.named: source.c.renamed_col,
+                     MergeWeird.score: source.c.s})
+                 .when_not_matched())
+        sql, params = self.render(query)
+        self.assertEqual(sql, (
+            'MERGE INTO "merge_weird" USING (VALUES '
+            '(CAST(%s AS INTEGER), CAST(%s AS VARCHAR), CAST(%s AS INTEGER))'
+            ') AS "src"("id", "renamed_col", "s") '
+            'ON ("merge_weird"."id" = "src"."id") '
+            'WHEN MATCHED THEN UPDATE SET '
+            '"renamed_col" = "src"."renamed_col", '
+            '"s" = "src"."s" '
+            'WHEN NOT MATCHED THEN INSERT ("id", "renamed_col", "s") '
+            'VALUES ("src"."id", "src"."renamed_col", "src"."s") '
+            'RETURNING "merge_weird"."id", "merge_weird"."renamed_col", '
+            '"merge_weird"."s"'))
+        self.assertEqual(params, [1, 'a', 2])
+
+        # The dict-row lookup accepts the field name and the column name.
+        for row in ({'id': 1, 'named': 'a', 'score': 2},
+                    {'id': 1, 'renamed_col': 'a', 's': 2}):
+            source = Merge.values(
+                [row], [MergeWeird.id, MergeWeird.named, MergeWeird.score])
+            self.assertEqual(source._columns, ('id', 'renamed_col', 's'))
+
+    def test_merge_foreign_key_model_value(self):
+        user = MergeUser(id=7)
+        source = Merge.values(
+            [{'id': 1, 'user': user, 'content': 'hi'}],
+            [MergeTweet.id, MergeTweet.user, MergeTweet.content])
+        query = (MergeTweet
+                 .merge(source, on=(MergeTweet.id == source.c.id))
+                 .when_matched(update={MergeTweet.content: source.c.content})
+                 .when_not_matched())
+        sql, params = self.render(query)
+        self.assertEqual(sql, (
+            'MERGE INTO "merge_tweet" USING (VALUES '
+            '(CAST(%s AS INTEGER), CAST(%s AS INTEGER), CAST(%s AS TEXT))'
+            ') AS "src"("id", "user_id", "content") '
+            'ON ("merge_tweet"."id" = "src"."id") '
+            'WHEN MATCHED THEN UPDATE SET "content" = "src"."content" '
+            'WHEN NOT MATCHED THEN INSERT ("id", "user_id", "content") '
+            'VALUES ("src"."id", "src"."user_id", "src"."content") '
+            'RETURNING "merge_tweet"."id", "merge_tweet"."user_id", '
+            '"merge_tweet"."content"'))
+        self.assertEqual(params, [1, 7, 'hi'])
+
+    def test_merge_values_empty(self):
+        with self.assertRaisesCtx(ValueError):
+            Merge.values([], [MergeUser.id])
+
+    def test_merge_requires_on_and_actions(self):
+        source = Merge.values([(1, 'huey', 1)],
+                              [MergeUser.id, MergeUser.username,
+                               MergeUser.age])
+        with self.assertRaisesCtx(ValueError):
+            self.render(MergeUser.merge(source).when_not_matched())
+        with self.assertRaisesCtx(ValueError):
+            self.render(
+                MergeUser.merge(source, on=(MergeUser.id == source.c.id)))
+
+    def test_merge_when_matched_requires_exactly_one_action(self):
+        source = Merge.values([(1, 'huey', 1)],
+                              [MergeUser.id, MergeUser.username,
+                               MergeUser.age])
+        query = MergeUser.merge(source, on=(MergeUser.id == source.c.id))
+        with self.assertRaisesCtx(ValueError):
+            query.when_matched(update={MergeUser.age: 1}, delete=True)
+        with self.assertRaisesCtx(ValueError):
+            query.when_matched()
+        with self.assertRaisesCtx(ValueError):
+            query.when_not_matched(
+                insert={MergeUser.username: 'x'}, do_nothing=True)
+
+    def test_merge_unsupported_database(self):
+        sqlite_db = get_in_memory_db()
+
+        class SqliteMergeModel(Model):
+            name = CharField()
+            class Meta:
+                database = sqlite_db
+                table_name = 'sqlite_merge_model'
+
+        source = Merge.values([(1, 'huey')],
+                              [SqliteMergeModel.id, SqliteMergeModel.name])
+        query = (SqliteMergeModel
+                 .merge(source, on=(SqliteMergeModel.id == source.c.id))
+                 .when_not_matched())
+
+        # SQL generation is refused by the sqlite dialect.
+        with self.assertRaisesCtx(NotSupportedError):
+            sqlite_db.get_sql_context().sql(query).query()
+
+        # Execution raises before any SQL is sent to the server.
+        with self.assertRaisesCtx(NotSupportedError):
+            query.execute()
+
+    def test_merge_unsupported_without_database(self):
+        table = Table('merge_user')
+        source = ValuesList([(1,)], columns=('id',), alias='s')
+        query = (table
+                 .merge(source, on=(table.c.id == source.c.id))
+                 .when_not_matched(insert={'id': source.c.id}))
+        with self.assertRaisesCtx(NotSupportedError):
+            __sql__(query)
+
+    def test_merge_postgres_version_gate(self):
+        pg_db = PostgresqlDatabase(None)
+        pg_db.server_version = 160004
+        self.assertFalse(pg_db.supports_merge())
+        pg_db.server_version = 170000
+        self.assertTrue(pg_db.supports_merge())
+
+        source = Merge.values([(1, 'huey', 1)],
+                              [MergeUser.id, MergeUser.username,
+                               MergeUser.age])
+        query = (MergeUser
+                 .merge(source, on=(MergeUser.id == source.c.id))
+                 .when_not_matched())
+        pg_db.server_version = 160004
+        with self.assertRaisesCtx(NotSupportedError):
+            query._execute(pg_db)

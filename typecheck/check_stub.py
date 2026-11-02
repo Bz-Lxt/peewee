@@ -5,6 +5,7 @@ from typing_extensions import assert_type
 
 from peewee import (
     SQL,
+    AutoField,
     BigBitField,
     BigBitFieldData,
     CharField,
@@ -12,18 +13,22 @@ from peewee import (
     DatabaseProxy,
     ForeignKeyField,
     IntegerField,
+    Merge,
     Model,
     ModelAlias,
     ModelDelete,
+    ModelMerge,
     ModelSelect,
     NodeList,
     NoopModelSelect,
     SqliteDatabase,
+    ValuesList,
     chunked,
 )
 
 
 class User(Model):
+    id = AutoField()
     username = CharField()
     age = IntegerField()
     nickname = CharField(null=True)
@@ -132,3 +137,30 @@ assert_type(chunked([1, 2, 3], 2), Generator[list[int], None, None])
 
 # Check() returns an SQL node, or a NodeList when a constraint name is given.
 assert_type(Check('age > 0'), SQL | NodeList)
+
+
+# merge() accepts a ValuesList built with Merge.values() (or a Select query)
+# and returns a ModelMerge; the WHEN MATCHED / NOT MATCHED builders chain and
+# stay typed as ModelMerge.
+merge_source = Merge.values(
+    [(1, 'huey', 3)], [User.id, User.username, User.age])
+assert_type(merge_source, ValuesList)
+merge_query = (User
+               .merge(merge_source, on=(User.id == merge_source.c.id))
+               .when_matched(
+                   update={User.username: merge_source.c.username},
+                   condition=(merge_source.c.age > 0))
+               .when_matched(delete=True)
+               .when_not_matched())
+assert_type(merge_query, ModelMerge)
+assert_type(
+    User.merge(merge_source, on=(User.id == merge_source.c.id))
+    .when_not_matched(do_nothing=True),
+    ModelMerge)
+assert_type(User.merge([(1, 'huey', 3)], fields=[User.id]), ModelMerge)
+assert_type(User.merge(User.select()), ModelMerge)
+
+# Database support flag is exposed uniformly; unsupported databases return
+# False rather than raising at import time.
+assert_type(real_db.supports_merge(), bool)
+assert_type(real_db.merge_support, bool)

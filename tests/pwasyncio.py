@@ -2434,6 +2434,73 @@ class TestPostgresqlIntegration(IntegrationTests, unittest.IsolatedAsyncioTestCa
                                 .order_by(M.id))])
             self.assertEqual(seeds, ['A', 'B'])
 
+    async def test_merge(self):
+        if self.db.server_version < 170000:
+            self.skipTest('requires Postgres 17+ for MERGE ... RETURNING')
+
+        await self.db.run(TestModel.create, id=1, name='huey', value=3)
+        await self.db.run(TestModel.create, id=2, name='mickey', value=8)
+        await self.db.run(TestModel.create, id=3, name='zaizee', value=1)
+
+        source = Merge.values(
+            [(1, 'huey-two', 4), (2, 'mickey', 0), (4, 'beanie', 2)],
+            [TestModel.id, TestModel.name, TestModel.value])
+        query = (TestModel
+                 .merge(source, on=(TestModel.id == source.c.id))
+                 .when_matched(delete=True,
+                               condition=(source.c.value < 1))
+                 .when_matched(update={
+                     TestModel.name: source.c.name,
+                     TestModel.value: source.c.value})
+                 .when_not_matched())
+        results = dict((row.id, row) for row in await self.db.list(query))
+        self.assertEqual(set(results), {1, 2, 4})
+        for row in results.values():
+            self.assertIsInstance(row, TestModel)
+            # Rows returned by RETURNING are clean model instances.
+            self.assertFalse(row.is_dirty())
+
+        self.assertEqual((results[1].name, results[1].value),
+                         ('huey-two', 4))
+        # The deleted row comes back with its pre-delete values.
+        self.assertEqual((results[2].name, results[2].value),
+                         ('mickey', 8))
+        self.assertEqual((results[4].name, results[4].value),
+                         ('beanie', 2))
+
+        stored = dict((row.id, (row.name, row.value)) for row in
+                      await self.db.list(TestModel.select()))
+        self.assertEqual(stored, {
+            1: ('huey-two', 4),
+            3: ('zaizee', 1),
+            4: ('beanie', 2)})
+
+    async def test_merge_select_source_and_gate(self):
+        if self.db.server_version < 170000:
+            self.skipTest('requires Postgres 17+ for MERGE ... RETURNING')
+
+        await self.db.run(TestModel.create, id=1, name='huey', value=3)
+        source = TestModel.select(TestModel.id, TestModel.name,
+                                  TestModel.value)
+        query = (TestModel
+                 .merge(source, on=(TestModel.id == source.c.id))
+                 .when_matched(update={TestModel.value: source.c.value})
+                 .when_not_matched())
+        rows = await self.db.list(query)
+        self.assertEqual(len(rows), 1)
+        self.assertIsInstance(rows[0], TestModel)
+
+        # Pretend the server is older than 17: execution must be refused.
+        self.db.server_version = 160004
+        source = Merge.values([(2, 'new', 1)],
+                              [TestModel.id, TestModel.name,
+                               TestModel.value])
+        query = (TestModel
+                 .merge(source, on=(TestModel.id == source.c.id))
+                 .when_not_matched())
+        with self.assertRaises(NotSupportedError):
+            await self.db.aexecute(query)
+
 
 @unittest.skipIf(not IS_MYSQL, 'skipping mysql test')
 @unittest.skipUnless(aiomysql, 'aiomysql not installed')
